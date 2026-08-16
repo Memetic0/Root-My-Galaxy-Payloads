@@ -5,6 +5,16 @@
 
 #include "offset.h"
 
+/* Physical slide geometry: highest bootloader slide candidate and its step.
+ * Targets whose sboot computes the slide differently (for example the S22+
+ * g0s slide = (smc_x2 & 0x3f) << 15) override both in target.h. */
+#ifndef SLIDE_P0_MAX_OFFSET
+#define SLIDE_P0_MAX_OFFSET 0x1f0000ULL
+#endif
+#ifndef SLIDE_P0_ALIGN
+#define SLIDE_P0_ALIGN 0x10000ULL
+#endif
+
 #define PAGE_SHIFT 12
 #define PAGE_SIZE (1UL << PAGE_SHIFT)
 #define KS_PAGE_SIZE 4096
