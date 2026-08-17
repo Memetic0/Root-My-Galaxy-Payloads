@@ -1021,8 +1021,12 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
 #if defined(APP_PHYS_VIRTUAL_BASE_ORACLE) && APP_PHYS_VIRTUAL_BASE_ORACLE
 static void cleanup_failed_kernel_page(const char *reason) {
   pr_info("kernel page cleanup failure=%s stage=kernelsnitch begin\n", reason);
+  pr_info("[TRIG] page-prepare cleanup begin\n");
+  fflush(stdout);
   kernelsnitch_cleanup(ks);
   ks = NULL;
+  pr_info("[TRIG] page-prepare ksnitch cleaned\n");
+  fflush(stdout);
   pr_info("kernel page cleanup failure=%s stage=kernelsnitch done\n", reason);
   pr_info("kernel page cleanup failure=%s stage=prepare-children begin count=%zu\n",
           reason, prepare_ctx.mm_cnt);
@@ -1437,7 +1441,11 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   pr_info("kernel page cleanup stage=prepare-children begin count=%zu\n",
           prepare_ctx.mm_cnt);
 #endif
+  pr_info("[TRIG] page-prepare killing %zu children\n", prepare_ctx.mm_cnt);
+  fflush(stdout);
   for (size_t i = 0; i < prepare_ctx.mm_cnt; i++) {
+    pr_info("[TRIG] kill child %zu/%zu\n", i + 1, prepare_ctx.mm_cnt);
+    fflush(stdout);
     if (prepare_ctx.memfds[i] >= 0) {
       SYSCHK(close(prepare_ctx.memfds[i]));
       prepare_ctx.memfds[i] = -1;
