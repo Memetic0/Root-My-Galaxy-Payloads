@@ -982,10 +982,14 @@ int verify_p0_pipe_oracle_gate(void) {
   int gate_hits = 0;
   int gate_pipe_index = -1;
   int changed_pages = 0;
+  pr_info("[TRIG] gate verify enter pipes=%d\n", PIPE_RECLAIM);
+  fflush(stdout);
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
   p0_gate_holders_initialized = 1;
 #endif
   for (size_t pipe_index = 0; pipe_index < PIPE_RECLAIM; pipe_index++) {
+    pr_info("[TRIG] gate verify pipe=%zu tee\n", pipe_index);
+    fflush(stdout);
     if (!pipe_duplicate_bytes(pipe_fds_reclaim[pipe_index][0],
                               p0_gate_holders[pipe_index], PAGE_SIZE, 1)) {
       pr_warning("p0 gate tee failed pipe=%zu errno=%d\n",
@@ -993,6 +997,8 @@ int verify_p0_pipe_oracle_gate(void) {
       spawn_p0_ref_keeper(-1);
       return 0;
     }
+    pr_info("[TRIG] gate verify pipe=%zu read\n", pipe_index);
+    fflush(stdout);
     if (!pipe_read_full(pipe_fds_reclaim[pipe_index][0], page,
                         sizeof(page))) {
       spawn_p0_ref_keeper(-1);

