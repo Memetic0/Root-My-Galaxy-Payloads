@@ -456,6 +456,12 @@ int expand_p0_pipe_oracle(void);
 int verify_p0_pipe_oracle_gate(void);
 int verify_p0_pipe_data_page(uintptr_t target, uint64_t expected);
 uintptr_t scan_p0_pipe_oracle(void);
+void p0_dump_gate_target(uintptr_t oracle_target);
+int slide_tracefs_try_leak(uintptr_t *offset_out);
+#if defined(SLIDE_APP_TRACEFS) && SLIDE_APP_TRACEFS
+extern int slide_classic_bank_mode;
+extern uintptr_t slide_classic_offset;
+#endif
 #if defined(APP_PHYS_VIRTUAL_BASE_ORACLE) && APP_PHYS_VIRTUAL_BASE_ORACLE
 uint64_t scan_p0_virtual_base_pointer(void);
 #endif

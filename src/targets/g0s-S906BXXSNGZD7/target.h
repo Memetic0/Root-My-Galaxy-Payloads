@@ -25,11 +25,14 @@
 #define LEGACY_RT_MUTEX_WAITER 1
 
 #define SLIDE_FAKE_WAITER_PRIO 120
-#define FAKE_WAITER_PRIO 120
 /* g0s stack geometry requires the res_in/res_out stamp lane. */
 #define SLIDE_RESOUT_LANE_DEFAULT 1
-#define SLIDE_LOCK_OWNER_VALUE 1ULL
+#define SLIDE_LOCK_OWNER_VALUE 0ULL
 #define SLIDE_USE_FAKE_TASK 1
+/* Proven-engine timing: the requeue must hit while the
+ * waiter is parked, and the EDEADLK wake (not a timeout)
+ * must end the wait. */
+#define SLIDE_WAIT_NSEC 2000000000L
 #define SLIDE_TRACEFS_EVENT_ID 104
 #define SLIDE_TRACEFS_WORKER_CALLER_OFF 0x000ffcc0ULL
 #define SLIDE_PSELECT_WORD_SHIFT 0
@@ -220,3 +223,4 @@
 #define FOPS_SHOW_FDINFO_OFF 0xe0
 
 #endif
+#define SLIDE_APP_TRACEFS 1

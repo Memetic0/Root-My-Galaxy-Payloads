@@ -28,6 +28,7 @@ PRELOAD_SRCS := \
 APP_PRELOAD_SRCS := \
   src/main.c \
   src/util.c \
+  src/slide.c \
   src/slide_app.c \
   src/fops.c \
   src/pipe.c \

