@@ -241,6 +241,20 @@
       }
     },
     {
+      "payloadId": "g0s-S906BXXSNGZD7",
+      "displayName": "Galaxy S22+ SM-S906B | Kernel 5.10.237",
+      "models": ["SM-S906B"],
+      "kernelVersions": ["5.10.237"],
+      "exploit": {
+    "url": "https://raw.githubusercontent.com/Memetic0/Root-My-Galaxy-Payloads/main/artifacts/g0s-S906BXXSNGZD7/cve-2026-43499-app.so",
+    "size": 1758368
+  },
+  "kernelsu": {
+    "url": "https://raw.githubusercontent.com/Memetic0/Root-My-Galaxy-Payloads/main/kernelsu/ksud-r0s-S901BXXSNGZD7-kdp",
+        "size": 4621280
+      }
+    },
+    {
       "payloadId": "dm3q-S9180ZHS8FZF5",
       "displayName": "Galaxy S23 Ultra | Kernel 5.15.189",
       "models": ["SM-S9180", "SM-S918N", "SM-S918Q", "SM-S918U", "SM-S918W", "SM-S918U1"],
