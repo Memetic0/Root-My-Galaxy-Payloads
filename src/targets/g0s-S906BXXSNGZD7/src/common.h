@@ -235,6 +235,8 @@ extern int pipe_stage_attempts;
 extern int cfi_dirty_seen;
 extern int cfi_last_step;
 extern int cfi_last_errno;
+extern int cfi_block_retry;
+#define CFI_RETRY_BLOCKED_EXIT 71
 extern uint64_t kmalloc_pipe_cache;
 extern uint64_t kmalloc_normal_1k_cache;
 extern uint64_t kmalloc_normal_2k_cache;
@@ -293,6 +295,7 @@ extern atomic_int fake_fops_done;
 int exp_stack_once(uint64_t *buffer);
 int install_embedded_exp32(void);
 int doreplacefops(void);
+pid_t spawn_stability_keeper(void);
 
 int run_exploit(int argc, char **argv);
 void read_first_line(const char *path, char *buf, size_t len);

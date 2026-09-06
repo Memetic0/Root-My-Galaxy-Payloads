@@ -149,7 +149,7 @@ an `arm-linux-gnueabi` cross-libc (errno.h) on the host.
 
 | Artifact | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `artifacts/g0s-S906BXXSNGZD7/cve-2026-43499-app.so` | 1758368 | `468917fdbaf8e996c2268342d803aa506cc4f1a970d89ac70cc0c229db86029d` |
+| `artifacts/g0s-S906BXXSNGZD7/cve-2026-43499-app.so` | 1761720 | `500355878433b206c6a481e3706dda3d8b7ed95a362dd369692fa4f4b268f969` |
 | `kernelsu/ksud-r0s-S901BXXSNGZD7-kdp` | 4621280 | `fc0097be827dab2078ba23e3e7af223905cc8ab38c763a602982071439ae7ed962` |
 | `kernelsu/android12-5.10_kernelsu-r0s-S901BXXSNGZD7-kdp.ko` | 323168 | `47a66801c8a1e94a757924fd30099065cea62edc80e14b83b0879cca22fef568` |
 
@@ -180,6 +180,11 @@ fork only hosts its own payload.
 - KernelSU: confirmed working — `ksud late-load` succeeds after the DEFEX
   bypass; KernelSU Manager reports `Working <LKM> [Jailbreak mode]`,
   version `32525-2`, and `su` is granted.
+- Crash mitigation: after a confirmed hijack the payload restores
+  `ashmem_misc.fops` before doing more work; the 32-bit waiter is left
+  alive after the trigger; uncertain misses hold reclaim pages and refuse
+  further attempts on that boot instead of retrying into a recycled fake
+  table (the previous reboot class).
 
 The result is a volatile root and LKM installation. A reboot removes root,
 KernelSU, and the DEFEX/SELinux clears; the exploit and late-load must be

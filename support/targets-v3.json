@@ -247,11 +247,11 @@
       "kernelVersions": ["5.10.237"],
       "exploit": {
     "url": "https://raw.githubusercontent.com/Memetic0/Root-My-Galaxy-Payloads/main/artifacts/g0s-S906BXXSNGZD7/cve-2026-43499-app.so",
-    "size": 1758368
+    "size": 1761720
   },
   "kernelsu": {
-    "url": "https://raw.githubusercontent.com/Memetic0/Root-My-Galaxy-Payloads/main/kernelsu/ksud-r0s-S901BXXSNGZD7-kdp",
-        "size": 4621280
+    "url": "https://raw.githubusercontent.com/Memetic0/Root-My-Galaxy-Payloads/main/kernelsu/android12-5.10_kernelsu-g0s-S906BXXSNGZD7-ksunext.ko",
+        "size": 462169
       }
     },
     {
