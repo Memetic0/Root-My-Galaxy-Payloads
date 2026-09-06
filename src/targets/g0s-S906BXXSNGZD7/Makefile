@@ -164,17 +164,15 @@ API32 ?= 28
 NDK_CC32 := $(NDK_TOOLCHAIN)/bin/armv7a-linux-androideabi$(API32)-clang
 HOST_CC32 ?= arm-linux-gnueabi-gcc
 
-# Prefer the NDK: the host arm-linux-gnueabi-gcc is often present without
-# a matching armel libc (errno.h), which breaks a from-scratch exp32 rebuild.
-ifneq ($(wildcard $(NDK_CC32)),)
+ifeq ($(shell command -v $(HOST_CC32) >/dev/null 2>&1 && echo yes),yes)
+  EXP_CC := $(HOST_CC32)
+  EXP_CFLAGS := -O2 -g0 -Wall -Isrc $(TARGET_CFLAGS) -static -pthread
+  EXP_LDFLAGS := -static -pthread
+else ifneq ($(wildcard $(NDK_CC32)),)
   EXP_CC := $(NDK_CC32)
   EXP_CFLAGS := -O2 -g0 -Wall -Isrc $(TARGET_CFLAGS) -fPIE -pthread \
     -Wno-unused-parameter -Wno-unused-function
   EXP_LDFLAGS := -static -pie -pthread
-else ifeq ($(shell command -v $(HOST_CC32) >/dev/null 2>&1 && echo yes),yes)
-  EXP_CC := $(HOST_CC32)
-  EXP_CFLAGS := -O2 -g0 -Wall -Isrc $(TARGET_CFLAGS) -static -pthread
-  EXP_LDFLAGS := -static -pthread
 else
   $(error no 32-bit ARM toolchain: install arm-linux-gnueabi-gcc or an NDK)
 endif

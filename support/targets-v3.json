@@ -305,7 +305,7 @@
       "ksuLoader": "late-load",
       "exploit": {
         "url": "https://raw.githubusercontent.com/Memetic0/Root-My-Galaxy-Payloads/main/artifacts/g0s-S906BXXSNGZD7/cve-2026-43499-app.so",
-        "size": 1761720
+        "size": 1758368
       },
       "kernelsu": {
         "url": "https://raw.githubusercontent.com/Memetic0/Root-My-Galaxy-Payloads/main/kernelsu/ksud-r0s-S901BXXSNGZD7-kdp",
@@ -324,7 +324,7 @@
       "ksuLoader": "insmod",
       "exploit": {
         "url": "https://raw.githubusercontent.com/Memetic0/Root-My-Galaxy-Payloads/main/artifacts/g0s-S906BXXSNGZD7/cve-2026-43499-app.so",
-        "size": 1761720
+        "size": 1758368
       },
       "kernelsu": {
         "url": "https://raw.githubusercontent.com/Memetic0/Root-My-Galaxy-Payloads/main/kernelsu/android12-5.10_kernelsu-g0s-S906BXXSNGZD7-ksunext.ko",

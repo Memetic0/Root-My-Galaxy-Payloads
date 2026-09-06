@@ -178,22 +178,17 @@ the device restarts.
 
 > [!WARNING]
 > **Reliability & Kernel Panic Notice:**
-> The race stage is timing-sensitive. This port restores `ashmem_misc.fops`
-> as soon as ARW is confirmed, keeps the 32-bit waiter process alive after
-> the trigger, and refuses further attempts (holding reclaim pages) if the
-> hijack cannot be undone. A remaining miss can still panic; reboot and
-> retry on a quiet boot if that happens.
+> The race stage is timing-sensitive and may fail or cause a kernel panic on
+> some runs. Clean boots offer a higher success rate.
 
 > [!TIP]
 > **Stability & Success Rate Recommendations:**
 > - **Reboot Device**: For the highest success rate, reboot the device before
 >   running the exploit to ensure clean slab/heap state.
-> - **Wait ~20s after boot**: the supervisor waits for `BOOT_QUIET_SEC`
->   (default 20) of uptime so the allocator is quieter.
 > - **Close Background Apps**: Ensure all background applications are closed.
 > - **Unlock Screen & Stay Idle**: Keep the device unlocked and do not
->   interact with or use the phone while the exploit is running.
-> - If the log says `refusing further attempts` / `cfi-hold`, **reboot**
->   before running again. Retrying on that boot can panic.
+>   interact with or use the phone while the exploit is running, as active
+>   user input/background tasks can disturb timing and potentially trigger a
+>   kernel panic.
 
 Use only on devices you own or are explicitly authorized to test.

